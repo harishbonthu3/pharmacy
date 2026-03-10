@@ -39,6 +39,11 @@ def safe_local_date(value):
         return None
 
 
+class HealthView(APIView):
+    def get(self, request, *args, **kwargs):
+        return Response({"status": "ok"})
+
+
 class SupplierViewSet(viewsets.ModelViewSet):
     queryset = Supplier.objects.all().order_by("-id")
     serializer_class = SupplierSerializer
