@@ -1,7 +1,6 @@
 from datetime import timedelta, datetime
 
 from django.db import transaction
-from django.db.models import Sum
 from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.response import Response
@@ -27,16 +26,15 @@ from .serializers import (
 )
 
 
-def safe_local_date(dt_value):
-    if not dt_value:
+def safe_local_date(value):
+    if not value:
         return None
-
     try:
-        if isinstance(dt_value, datetime):
-            if timezone.is_aware(dt_value):
-                dt_value = timezone.localtime(dt_value)
-            return dt_value.date()
-        return dt_value
+        if isinstance(value, datetime):
+            if timezone.is_aware(value):
+                value = timezone.localtime(value)
+            return value.date()
+        return value
     except Exception:
         return None
 
@@ -95,10 +93,7 @@ class SaleViewSet(viewsets.ModelViewSet):
             if customer_phone:
                 customer, created = Customer.objects.get_or_create(
                     phone=customer_phone,
-                    defaults={
-                        "name": customer_name or customer_phone,
-                        "points": 0,
-                    },
+                    defaults={"name": customer_name or customer_phone, "points": 0},
                 )
                 if not created and customer_name and customer.name != customer_name:
                     customer.name = customer_name
@@ -115,7 +110,7 @@ class SaleViewSet(viewsets.ModelViewSet):
 
             for item in items:
                 medicine_id = item["medicine_id"]
-                qty_needed = item["qty"]
+                qty_needed = int(item["qty"])
                 price = item["price"]
 
                 medicine = Medicine.objects.filter(id=medicine_id).first()
@@ -126,7 +121,7 @@ class SaleViewSet(viewsets.ModelViewSet):
                         status=status.HTTP_400_BAD_REQUEST,
                     )
 
-                available_stock = sum(batch.qty for batch in medicine.batches.all())
+                available_stock = sum(int(batch.qty or 0) for batch in medicine.batches.all())
                 if available_stock < qty_needed:
                     transaction.set_rollback(True)
                     return Response(
@@ -144,11 +139,10 @@ class SaleViewSet(viewsets.ModelViewSet):
                 for batch in batches:
                     if remaining <= 0:
                         break
-
                     if batch.qty <= 0:
                         continue
 
-                    deduct = min(batch.qty, remaining)
+                    deduct = min(int(batch.qty), remaining)
                     batch.qty -= deduct
                     batch.save(update_fields=["qty"])
                     remaining -= deduct
@@ -168,8 +162,7 @@ class SaleViewSet(viewsets.ModelViewSet):
                     line_total=price * qty_needed,
                 )
 
-            read_serializer = SaleSerializer(sale)
-            return Response(read_serializer.data, status=status.HTTP_201_CREATED)
+            return Response(SaleSerializer(sale).data, status=status.HTTP_201_CREATED)
 
 
 class DashboardSummaryView(APIView):
@@ -178,37 +171,28 @@ class DashboardSummaryView(APIView):
             today = timezone.localdate()
             expiry_limit = today + timedelta(days=30)
 
-            # today sales - Python side calculation to avoid SQLite date function issues
             today_sales_total = 0.0
-            all_sales = Sale.objects.all().prefetch_related("items__medicine")
-            for sale in all_sales:
+            for sale in Sale.objects.all():
                 sale_date = safe_local_date(sale.date)
                 if sale_date == today:
                     today_sales_total += float(sale.total or 0)
 
-            # low stock count
             low_stock_count = 0
-            medicines = Medicine.objects.prefetch_related("batches").all()
-            for medicine in medicines:
+            for medicine in Medicine.objects.prefetch_related("batches").all():
                 total_qty = sum(int(batch.qty or 0) for batch in medicine.batches.all())
                 if total_qty <= 10:
                     low_stock_count += 1
 
-            # expiry soon
             expiry_soon_count = 0
-            batches = MedicineBatch.objects.filter(qty__gt=0)
-            for batch in batches:
+            for batch in MedicineBatch.objects.filter(qty__gt=0):
                 if batch.expiry and today <= batch.expiry <= expiry_limit:
                     expiry_soon_count += 1
 
-            # top selling
             top_map = {}
-            sale_items = SaleItem.objects.select_related("medicine").all()
-            for item in sale_items:
+            for item in SaleItem.objects.select_related("medicine").all():
                 med_name = item.medicine.name if item.medicine else "Unknown"
                 if med_name not in top_map:
                     top_map[med_name] = {"name": med_name, "qty": 0, "amount": 0.0}
-
                 top_map[med_name]["qty"] += int(item.qty or 0)
                 top_map[med_name]["amount"] += float(item.line_total or 0)
 
@@ -218,19 +202,15 @@ class DashboardSummaryView(APIView):
                 reverse=True,
             )[:5]
 
-            total_customers = Customer.objects.count()
-            total_suppliers = Supplier.objects.count()
-            total_medicines = Medicine.objects.count()
-
             return Response(
                 {
                     "today_sales": float(today_sales_total),
                     "low_stock_alerts": low_stock_count,
                     "expiry_soon_alerts": expiry_soon_count,
                     "top_selling": top_selling,
-                    "total_customers": total_customers,
-                    "total_suppliers": total_suppliers,
-                    "total_medicines": total_medicines,
+                    "total_customers": Customer.objects.count(),
+                    "total_suppliers": Supplier.objects.count(),
+                    "total_medicines": Medicine.objects.count(),
                 }
             )
         except Exception as e:
@@ -270,31 +250,25 @@ class ReportsView(APIView):
             rows = []
             total_sales = 0.0
 
-            sales = Sale.objects.select_related("customer").all().order_by("-date")
-            for s in sales:
-                sale_date = safe_local_date(s.date)
-                if not sale_date:
-                    continue
-                if not (start_date <= sale_date <= end_date):
+            for sale in Sale.objects.select_related("customer").all().order_by("-date"):
+                sale_date = safe_local_date(sale.date)
+                if not sale_date or not (start_date <= sale_date <= end_date):
                     continue
 
-                total_sales += float(s.total or 0)
+                total_sales += float(sale.total or 0)
                 rows.append({
-                    "invoice": s.invoice,
+                    "invoice": sale.invoice,
                     "date": sale_date.strftime("%Y-%m-%d"),
-                    "customer": s.customer.name if s.customer else "-",
-                    "subtotal": float(s.subtotal or 0),
-                    "discount_percent": float(s.discount_percent or 0),
-                    "gst_percent": float(s.gst_percent or 0),
-                    "total": float(s.total or 0),
+                    "customer": sale.customer.name if sale.customer else "-",
+                    "subtotal": float(sale.subtotal or 0),
+                    "discount_percent": float(sale.discount_percent or 0),
+                    "gst_percent": float(sale.gst_percent or 0),
+                    "total": float(sale.total or 0),
                 })
 
             return Response({
                 "type": "sales",
-                "summary": {
-                    "count": len(rows),
-                    "total_sales": total_sales,
-                },
+                "summary": {"count": len(rows), "total_sales": total_sales},
                 "rows": rows,
             })
 
@@ -302,12 +276,9 @@ class ReportsView(APIView):
             rows = []
             total_profit = 0.0
 
-            items = SaleItem.objects.select_related("medicine", "sale").all()
-            for item in items:
+            for item in SaleItem.objects.select_related("medicine", "sale").all():
                 sale_date = safe_local_date(item.sale.date if item.sale else None)
-                if not sale_date:
-                    continue
-                if not (start_date <= sale_date <= end_date):
+                if not sale_date or not (start_date <= sale_date <= end_date):
                     continue
 
                 medicine = item.medicine
@@ -329,43 +300,34 @@ class ReportsView(APIView):
 
             return Response({
                 "type": "profit",
-                "summary": {
-                    "count": len(rows),
-                    "total_profit": total_profit,
-                },
+                "summary": {"count": len(rows), "total_profit": total_profit},
                 "rows": rows,
             })
 
         if report_type == "expiry":
-            data = []
-            rows = MedicineBatch.objects.select_related("medicine").filter(qty__gt=0).order_by("expiry")
-
-            for row in rows:
-                if row.expiry and start_date <= row.expiry <= end_date:
-                    data.append({
-                        "medicine": row.medicine.name,
-                        "batch_no": row.batch_no,
-                        "expiry": row.expiry.strftime("%Y-%m-%d"),
-                        "qty": row.qty,
-                        "mrp": float(row.mrp or 0),
+            rows = []
+            for batch in MedicineBatch.objects.select_related("medicine").filter(qty__gt=0).order_by("expiry"):
+                if batch.expiry and start_date <= batch.expiry <= end_date:
+                    rows.append({
+                        "medicine": batch.medicine.name,
+                        "batch_no": batch.batch_no,
+                        "expiry": batch.expiry.strftime("%Y-%m-%d"),
+                        "qty": batch.qty,
+                        "mrp": float(batch.mrp or 0),
                     })
 
             return Response({
                 "type": "expiry",
-                "summary": {
-                    "count": len(data),
-                },
-                "rows": data,
+                "summary": {"count": len(rows)},
+                "rows": rows,
             })
 
         if report_type == "low-stock":
-            data = []
-            medicines = Medicine.objects.prefetch_related("batches").all()
-
-            for medicine in medicines:
+            rows = []
+            for medicine in Medicine.objects.prefetch_related("batches").all():
                 total_qty = sum(int(batch.qty or 0) for batch in medicine.batches.all())
                 if total_qty <= 10:
-                    data.append({
+                    rows.append({
                         "medicine": medicine.name,
                         "category": medicine.category,
                         "stock": total_qty,
@@ -374,10 +336,8 @@ class ReportsView(APIView):
 
             return Response({
                 "type": "low-stock",
-                "summary": {
-                    "count": len(data),
-                },
-                "rows": data,
+                "summary": {"count": len(rows)},
+                "rows": rows,
             })
 
         return Response({"detail": "Invalid report type."}, status=400)
